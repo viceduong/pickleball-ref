@@ -51,8 +51,21 @@ final class CalibrationTests: XCTestCase {
         let cam = Synthetic.camera(eye: eye, target: target, width: w, height: h)
         let img = Synthetic.renderCourt(cam, width: w, height: h, seed: seed)
         let result = try XCTUnwrap(CourtCalibrator().calibrate(img), "court not found")
-        let err = AutoCalibration.cornerDistance(cam.groundHomography, result.courtToImage)
-        XCTAssertLessThan(err, 3.0, "corner reprojection error \(err) px")
+        // Max reprojection error over court points visible in the image, modulo court symmetry.
+        var grid: [Vec2] = []
+        for i in 0...8 { for j in 0...22 { grid.append(Vec2(Double(i) * 2.5, Double(j) * 2)) } }
+        let visible = grid.filter { g in
+            guard let p = cam.project(Vec3(g.x, g.y, 0)) else { return false }
+            return p.x >= 0 && p.y >= 0 && p.x < Double(w) && p.y < Double(h)
+        }
+        let flips = [(false, false), (true, false), (false, true), (true, true)]
+        let err = flips.map { fx, fy in
+            visible.map { g -> Double in
+                let f = Vec2(fx ? Court.width - g.x : g.x, fy ? Court.length - g.y : g.y)
+                return (result.courtToImage.apply(f) - cam.groundHomography.apply(g)).length
+            }.max() ?? .infinity
+        }.min()!
+        XCTAssertLessThan(err, 3.0, "max visible reprojection error \(err) px")
         XCTAssertGreaterThan(result.inlierRatio, 0.6)
     }
 
@@ -66,6 +79,14 @@ final class CalibrationTests: XCTestCase {
 
     func testAutoCalibrationSidelineView() throws {
         try run(eye: Vec3(-22, 22, 11), target: Vec3(10, 22, 0), seed: 9)
+    }
+
+    func testAutoCalibrationKitchenSideView() throws {
+        try run(eye: Vec3(-12, 22, 7), target: Vec3(10, 22, 0), seed: 6)
+    }
+
+    func testAutoCalibrationFarBaselineView() throws {
+        try run(eye: Vec3(10, 62, 8), target: Vec3(10, 20, 0), seed: 2)
     }
 }
 

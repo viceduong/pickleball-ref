@@ -21,12 +21,15 @@ struct BallEvent: Codable {
 /// with monocular physics-constrained 3D arcs.
 final class EventDetector {
     var sidePoints = 5
-    var minKink = 0.35
-    var maxWindow = 0.22
+    /// Half-window of the hinge regression (s).
+    var window = 0.1
+    /// Significance threshold for the velocity jump (synthetic noise: false ≤ 49, true ≥ 91).
+    var minChi2 = 60.0
+    var noiseFloorPx = 0.5
 
     struct Kink {
         var j: Int
-        var kink: Double
+        var kink: Double      // χ² of the velocity jump
         var t: Double
         var p: Vec2
         var gap: Double
@@ -44,35 +47,38 @@ final class EventDetector {
         }
     }
 
+    /// Hinge regression around every split: p(t) = a + b·d + c·d² + Δv·max(0, d), d = t − τ, fitted jointly over
+    /// ±`window` seconds with the contact time τ scanned between frames. Continuity is built in, the whole window
+    /// constrains the contact point, and Δv is tested for significance (χ² against the residual noise level).
     func detectKinks(_ pts: [TrackPoint]) -> [Kink] {
-        let m = sidePoints
+        guard pts.count >= 10 else { return [] }
+        let span = pts.last!.t - pts.first!.t
+        let fps = Double(pts.count - 1) / max(1e-3, span)
+        let m = max(sidePoints, Int((window * fps).rounded()))
         guard pts.count >= 2 * m else { return [] }
         var cands: [Kink] = []
         for j in (m - 1)..<(pts.count - m) {
-            let left = Array(pts[(j - m + 1)...j])
-            let right = Array(pts[(j + 1)...(j + m)])
-            if left.last!.t - left.first!.t > maxWindow || right.last!.t - right.first!.t > maxWindow { continue }
-            if right.first!.t - left.last!.t > 0.08 { continue }
-            let tSplit = 0.5 * (left.last!.t + right.first!.t)
-            guard let fl = QuadFit.fit(left.map(\.t), left.map(\.p), t0: tSplit),
-                  let fr = QuadFit.fit(right.map(\.t), right.map(\.p), t0: tSplit) else { continue }
-            let ta = left.last!.t, tb = right.first!.t
-            var bestT = tSplit, bestGap = Double.infinity
-            for s in 0...40 {
-                let tt = ta + (tb - ta) * Double(s) / 40
-                let g = (fl.position(tt) - fr.position(tt)).length
-                if g < bestGap { bestGap = g; bestT = tt }
+            let seg = pts[(j - m + 1)...(j + m)]
+            if seg.last!.t - seg.first!.t > 2.6 * window + 0.05 { continue }   // gap in the track
+            var best: (rss: Double, tau: Double, coef: [Vec2], c00: Double, c33: Double)?
+            for s in 0...8 {
+                let tau = pts[j].t + (pts[j + 1].t - pts[j].t) * Double(s) / 8
+                guard let f = hingeFit(seg, tau: tau) else { continue }
+                if best == nil || f.rss < best!.rss { best = (f.rss, tau, f.coef, f.c00, f.c33) }
             }
-            let vL = fl.velocity(bestT), vR = fr.velocity(bestT)
-            let kink = (vR - vL).length / max(60, max(vL.length, vR.length))
-            let p = 0.5 * (fl.position(bestT) + fr.position(bestT))
-            cands.append(Kink(j: j, kink: kink, t: bestT, p: p, gap: bestGap, rms: max(fl.rms, fr.rms), vL: vL, vR: vR))
+            guard let b = best else { continue }
+            let dof = Double(2 * seg.count - 8)
+            let sigma = max(noiseFloorPx, (b.rss / max(1, dof)).squareRoot())
+            let dv = b.coef[3]
+            let chi2 = simd_length_squared(dv) / (sigma * sigma * b.c33)
+            let vL = b.coef[1], vR = b.coef[1] + dv
+            cands.append(Kink(j: j, kink: chi2, t: b.tau, p: b.coef[0], gap: sigma * b.c00.squareRoot(), rms: sigma, vL: vL, vR: vR))
         }
         var out: [Kink] = []
-        for (i, c) in cands.enumerated() {
-            guard c.kink >= minKink, c.gap <= 4 + 3 * c.rms else { continue }
+        let sep = max(3, m / 2)
+        for (i, c) in cands.enumerated() where c.kink >= minChi2 {
             var isMax = true
-            for k in max(0, i - m)...min(cands.count - 1, i + m) where k != i && abs(cands[k].j - c.j) < m {
+            for k in max(0, i - sep)...min(cands.count - 1, i + sep) where k != i {
                 if cands[k].kink > c.kink || (cands[k].kink == c.kink && k < i) { isMax = false; break }
             }
             if isMax { out.append(c) }
@@ -80,12 +86,36 @@ final class EventDetector {
         return out
     }
 
+    private func hingeFit(_ seg: ArraySlice<TrackPoint>, tau: Double) -> (rss: Double, coef: [Vec2], c00: Double, c33: Double)? {
+        var xtx = [Double](repeating: 0, count: 16)
+        var xtpx = [Double](repeating: 0, count: 4), xtpy = [Double](repeating: 0, count: 4)
+        for p in seg {
+            let d = p.t - tau
+            let row = [1, d, d * d, max(0, d)]
+            for a in 0..<4 {
+                xtpx[a] += row[a] * p.x; xtpy[a] += row[a] * p.y
+                for b in 0..<4 { xtx[a * 4 + b] += row[a] * row[b] }
+            }
+        }
+        guard let cx = LinearSolver.solve(xtx, xtpx, n: 4), let cy = LinearSolver.solve(xtx, xtpy, n: 4),
+              let e0 = LinearSolver.solve(xtx, [1, 0, 0, 0], n: 4), let e3 = LinearSolver.solve(xtx, [0, 0, 0, 1], n: 4) else { return nil }
+        var rss = 0.0
+        for p in seg {
+            let d = p.t - tau
+            let row = [1, d, d * d, max(0, d)]
+            var ex = p.x, ey = p.y
+            for a in 0..<4 { ex -= row[a] * cx[a]; ey -= row[a] * cy[a] }
+            rss += ex * ex + ey * ey
+        }
+        return (rss, (0..<4).map { Vec2(cx[$0], cy[$0]) }, e0[0], e3[3])
+    }
+
     private func classify(_ k: Kink, pts: [TrackPoint], segBefore: ClosedRange<Int>, segAfter: ClosedRange<Int>,
                           geometry: CourtGeometry?) -> BallEvent {
         var kind: BallEvent.Kind
         var travel = 0.0
         var height: Double?
-        let residual = (k.rms * k.rms + k.gap * k.gap / 4).squareRoot()
+        let residual = k.gap   // 1σ image position of the contact from the regression
 
         // 1. Physics: 3D arcs before/after.
         if let g = geometry, let pose = g.pose,

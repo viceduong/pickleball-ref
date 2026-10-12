@@ -93,6 +93,16 @@ enum LineMask {
 struct DetectedLine {
     var line: Line2D
     var support: Int
+    /// Extent of supporting pixels along the line direction (projection onto `line.direction`).
+    var lo: Double = 0
+    var hi: Double = 0
+
+    /// True if both painted extents contain the intersection (lines physically cross).
+    func crosses(_ o: DetectedLine, margin: Double = 12) -> Bool {
+        guard let p = line.intersect(o.line) else { return false }
+        let u = simd_dot(p, line.direction), v = simd_dot(p, o.line.direction)
+        return u >= lo - margin && u <= hi + margin && v >= o.lo - margin && v <= o.hi + margin
+    }
 }
 
 enum HoughLines {
@@ -146,30 +156,36 @@ enum HoughLines {
         }
         peaks.sort { $0.0 > $1.0 }
 
+        // Greedy: each accepted line removes its pixels, so chords through thick near lines can't re-use them.
         var lines: [DetectedLine] = []
-        for (_, t, r) in peaks.prefix(maxLines * 3) {
+        var alive = [Bool](repeating: true, count: points.count)
+        for (_, t, r) in peaks.prefix(maxLines * 4) {
             let n = Vec2(cosT[t], sinT[t])
             let rho = Double(r - dMax)
-            let raw = Line2D(n: n, c: rho + simd_dot(n, Vec2(cx, cy)))
-            guard let refined = refine(raw, points: points, band: 2.5) else { continue }
-            if lines.contains(where: { similar($0.line, refined.line) }) { continue }
-            if refined.support < minVotes { continue }
-            lines.append(refined)
+            var cur = Line2D(n: n, c: rho + simd_dot(n, Vec2(cx, cy)))
+            var ok = true
+            for _ in 0..<2 {
+                var sup: [Vec2] = []
+                for (i, p) in points.enumerated() where alive[i] && abs(cur.distance(p)) <= 2.5 { sup.append(p) }
+                guard sup.count >= 2, let l = Line2D.fit(sup) else { ok = false; break }
+                cur = l
+            }
+            guard ok else { continue }
+            var aliveCount = 0, total = 0
+            var lo = Double.infinity, hi = -Double.infinity
+            let dir = cur.direction
+            for (i, p) in points.enumerated() where abs(cur.distance(p)) <= 1.5 {
+                total += 1
+                if alive[i] { aliveCount += 1 }
+                let u = simd_dot(p, dir)
+                lo = min(lo, u); hi = max(hi, u)
+            }
+            if aliveCount < minVotes || lines.contains(where: { similar($0.line, cur) }) { continue }
+            lines.append(DetectedLine(line: cur, support: total, lo: lo, hi: hi))
+            for (i, p) in points.enumerated() where alive[i] && abs(cur.distance(p)) <= 2.5 { alive[i] = false }
             if lines.count >= maxLines { break }
         }
         return lines.sorted { $0.support > $1.support }
-    }
-
-    static func refine(_ line: Line2D, points: [Vec2], band: Double) -> DetectedLine? {
-        var current = line
-        var support: [Vec2] = []
-        for _ in 0..<2 {
-            support = points.filter { abs(current.distance($0)) <= band }
-            guard support.count >= 2, let l = Line2D.fit(support) else { return nil }
-            current = l
-        }
-        let count = points.reduce(0) { abs(current.distance($1)) <= 1.5 ? $0 + 1 : $0 }
-        return DetectedLine(line: current, support: count)
     }
 
     static func similar(_ a: Line2D, _ b: Line2D, angleTol: Double = 2.0 * .pi / 180, offsetTol: Double = 6) -> Bool {
