@@ -14,7 +14,7 @@ final class VisionTrajectoryDetector {
     init() { request = Self.makeRequest() }
 
     private static func makeRequest() -> VNDetectTrajectoriesRequest {
-        let r = VNDetectTrajectoriesRequest(frameAnalysisSpacing: CMTime(value: 1, timescale: 120), trajectoryLength: 6)
+        let r = VNDetectTrajectoriesRequest(frameAnalysisSpacing: CMTime(value: 1, timescale: 120), trajectoryLength: 6, completionHandler: nil)
         r.objectMinimumNormalizedRadius = 0.0008
         r.objectMaximumNormalizedRadius = 0.02
         return r
@@ -98,7 +98,7 @@ final class NeuralBallDetector {
     private let model: MLModel
     var threshold: Float = 0.35
 
-    static var isBundled: Bool { Bundle.main.url(forResource: "WASB", withExtension: "mlmodelc") != nil }
+    static let isBundled: Bool = NeuralBallDetector() != nil
 
     init?() {
         guard let url = Bundle.main.url(forResource: "WASB", withExtension: "mlmodelc") else { return nil }

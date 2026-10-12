@@ -2,6 +2,7 @@ import AVFoundation
 import Combine
 import Foundation
 import SwiftUI
+import UIKit
 
 final class AppModel: ObservableObject {
     @Published var status = "Starting camera…"
@@ -15,7 +16,7 @@ final class AppModel: ObservableObject {
     @Published var linkPhones = false { didSet { linkPhones ? peers.start() : peers.stop() } }
     @Published var cameraDenied = false
 
-    let engine = RefereeEngine()
+    let engine: RefereeEngine
     let capture: CaptureEngine
     let peers = PeerLink()
     private let speech = AVSpeechSynthesizer()
@@ -27,7 +28,9 @@ final class AppModel: ObservableObject {
     var neuralAvailable: Bool { capture.hasNeuralModel }
 
     init() {
-        capture = CaptureEngine(engine: engine)
+        let e = RefereeEngine()
+        engine = e
+        capture = CaptureEngine(engine: e)
         capture.onCalibration = { [weak self] g, msg in
             self?.geometry = g
             self?.status = g.map { Self.describe($0) } ?? msg

@@ -81,8 +81,8 @@ struct Trajectory3D {
             }
             if iteration >= 1 && iteration < 3 { k = quadDrag * simd_length(v0) }
         }
-        guard let (p0, v0) = sol else { return nil }
-        var traj = Trajectory3D(t0: t0, p0: p0, v0: v0, k: k, rmsPx: 0)
+        guard let s = sol else { return nil }
+        var traj = Trajectory3D(t0: t0, p0: s.0, v0: s.1, k: k, rmsPx: 0)
         var err = 0.0
         for o in pts {
             guard let p = pose.project(traj.position(o.t)) else { return nil }

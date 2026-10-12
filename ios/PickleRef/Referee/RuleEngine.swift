@@ -145,7 +145,7 @@ final class RuleEngine {
         // Serve must land diagonally in the opposite half; infer the server from the first ball position
         // or, failing that, from travel direction and landing side.
         let landingHalf = Court.half(of: c.point)
-        let targetHalf: Court.Half = serverHalf.map { $0 == .near ? .far : .near } ?? landingHalf
+        let targetHalf: Court.Half = serverHalf.map { (h: Court.Half) -> Court.Half in h == .near ? .far : .near } ?? landingHalf
         let targetSide: Court.Side
         if let s = serverSide {
             targetSide = s == .left ? .right : .left

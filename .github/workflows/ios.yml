@@ -81,7 +81,9 @@ jobs:
           cd /tmp && unzip -q xcodegen.zip -d xcgen
           echo "/tmp/xcgen/xcodegen/bin" >> $GITHUB_PATH
       - name: Generate project
-        run: cd ios && xcodegen generate --spec project.yml
+        run: |
+          mkdir -p ios/Models/WASB.mlmodelc   # placeholder; tests don't need the neural model
+          cd ios && xcodegen generate --spec project.yml
       - name: Test
         run: |
           cd ios
