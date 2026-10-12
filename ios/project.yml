@@ -1,0 +1,70 @@
+name: PickleRef
+options:
+  bundleIdPrefix: com.pickleref
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    CODE_SIGN_STYLE: Automatic
+
+targets:
+  PickleRef:
+    type: application
+    platform: iOS
+    sources:
+      - PickleRef
+      - path: Models/WASB.mlmodelc
+        type: folder
+        buildPhase: resources
+        optional: true
+    info:
+      path: PickleRef/Info.plist
+      properties:
+        CFBundleDisplayName: PickleRef
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        LSRequiresIPhoneOS: true
+        NSCameraUsageDescription: PickleRef films the court to track the ball and make line calls on this device.
+        NSLocalNetworkUsageDescription: PickleRef links nearby phones to combine camera views for more accurate calls.
+        NSBonjourServices:
+          - _pkref._tcp
+          - _pkref._udp
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UILaunchScreen: {}
+        UIRequiresFullScreen: true
+        UIStatusBarHidden: true
+        UIRequiredDeviceCapabilities:
+          - arm64
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationLandscapeRight
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.pickleref.app
+        INFOPLIST_FILE: PickleRef/Info.plist
+        IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+        GENERATE_INFOPLIST_FILE: NO
+        SWIFT_STRICT_CONCURRENCY: minimal
+        COREML_CODEGEN_LANGUAGE: None
+    scheme:
+      testTargets:
+        - PickleRefTests
+
+  PickleRefTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - PickleRefTests
+    dependencies:
+      - target: PickleRef
+    settings:
+      base:
+        IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+        GENERATE_INFOPLIST_FILE: YES
