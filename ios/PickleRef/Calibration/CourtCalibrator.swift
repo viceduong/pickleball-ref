@@ -45,9 +45,14 @@ final class CourtCalibrator {
         let wide = mask.dilated(2)
         guard let best = search(lines: lines, mask: wide, width: img.width, height: img.height) else { return nil }
         var h = best
+        let s0 = score(h, samples: samples, mask: wide)
+        var hScore = 2 * s0.hits - s0.visible
         for band in [6.0, 3.0, 3.0] {
             guard let r = refine(h, maskPoints: pts, width: img.width, height: img.height, band: band) else { break }
-            h = r
+            let sc = score(r, samples: samples, mask: wide)
+            let rScore = 2 * sc.hits - sc.visible
+            if rScore + 2 < hScore { break }   // refinement made it worse
+            h = r; hScore = rScore
         }
         let (hits, vis) = score(h, samples: samples, mask: wide)
         guard vis > 0 else { return nil }
@@ -175,33 +180,49 @@ final class CourtCalibrator {
 
     // MARK: - Refinement
 
-    /// Re-fit every visible court line on nearby mask pixels, then re-estimate H from all line intersections.
+    /// Re-fit every visible court line on the mask pixels it owns (each pixel belongs to its nearest predicted
+    /// segment, so junctions don't bias short lines), then re-estimate H from all line intersections.
     private func refine(_ h: Homography, maskPoints: [Vec2], width: Int, height: Int, band: Double) -> Homography? {
+        struct Pred { let family: Court.Family; let value: Double; let line: Line2D; let a: Vec2; let dir: Vec2; let len: Double }
+        var preds: [Pred] = []
+        for s in Court.segments {
+            let a = h.apply(s.a), b = h.apply(s.b)
+            guard a.x.isFinite, a.y.isFinite, b.x.isFinite, b.y.isFinite, (b - a).length > 1 else { continue }
+            preds.append(Pred(family: s.family, value: s.value, line: Line2D(through: a, b), a: a, dir: (b - a).normalized, len: (b - a).length))
+        }
+        guard !preds.isEmpty else { return nil }
+        var owned = [[Vec2]](repeating: [], count: preds.count)
+        for p in maskPoints {
+            var best = -1, bestD = band
+            for (k, pr) in preds.enumerated() {
+                let u = simd_dot(p - pr.a, pr.dir)
+                if u < -2 || u > pr.len + 2 { continue }
+                let d = abs(pr.line.distance(p))
+                if d <= bestD { bestD = d; best = k }
+            }
+            if best >= 0 { owned[best].append(p) }
+        }
         var across: [Double: Line2D] = [:]
         var along: [Double: Line2D] = [:]
-        for value in Set(Court.acrossValues + Court.alongValues).sorted() {
-            for family in [Court.Family.across, .along] {
-                let values = family == .across ? Court.acrossValues : Court.alongValues
-                guard values.contains(value) else { continue }
-                let segs = Court.segments.filter { $0.family == family && $0.value == value }
-                var support: [Vec2] = []
-                var predicted: Line2D?
-                for s in segs {
-                    let a = h.apply(s.a), b = h.apply(s.b)
-                    guard a.x.isFinite, b.x.isFinite, (b - a).length > 1 else { continue }
-                    let line = Line2D(through: a, b)
-                    predicted = line
-                    let dir = (b - a).normalized, len = (b - a).length
-                    for p in maskPoints where abs(line.distance(p)) <= band {
-                        let u = simd_dot(p - a, dir)
-                        if u >= -2 && u <= len + 2 { support.append(p) }
-                    }
+        var keys: [(Court.Family, Double)] = []
+        for pr in preds where !keys.contains(where: { $0.0 == pr.family && $0.1 == pr.value }) { keys.append((pr.family, pr.value)) }
+        for (family, value) in keys {
+            let idx = preds.indices.filter { preds[$0].family == family && preds[$0].value == value }
+            let support = idx.flatMap { owned[$0] }
+            // Visible predicted length (px) — require support proportional to it.
+            var visible = 0.0
+            for k in idx {
+                let pr = preds[k]
+                var inside = 0
+                for i in 0..<100 {
+                    let q = pr.a + pr.dir * (pr.len * Double(i) / 99)
+                    if q.x >= 0 && q.y >= 0 && q.x < Double(width) && q.y < Double(height) { inside += 1 }
                 }
-                guard support.count >= 25, let fitted = Line2D.fit(support), let pred = predicted else { continue }
-                // Reject refits that rotated away from the prediction (grabbed another line).
-                guard HoughLines.similar(pred, fitted, angleTol: 4 * .pi / 180, offsetTol: band + 2) else { continue }
-                if family == .across { across[value] = fitted } else { along[value] = fitted }
+                visible += pr.len * Double(inside) / 100
             }
+            guard Double(support.count) >= max(25, 0.5 * visible), let fitted = Line2D.fit(support) else { continue }
+            guard HoughLines.similar(preds[idx[0]].line, fitted, angleTol: 4 * .pi / 180, offsetTol: band + 2) else { continue }
+            if family == .across { across[value] = fitted } else { along[value] = fitted }
         }
         var src: [Vec2] = [], dst: [Vec2] = []
         let margin = 0.25 * Double(max(width, height))
