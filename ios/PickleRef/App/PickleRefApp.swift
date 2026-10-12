@@ -19,22 +19,42 @@ struct PickleRefApp: App {
 struct CameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
 
+    /// The preview connection only exists once the session has its input (configured asynchronously),
+    /// so the landscape orientation is re-applied on layout and whenever the session starts running.
     final class PreviewView: UIView {
         override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
         var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
+        private var observer: NSObjectProtocol?
+
+        func attach(_ session: AVCaptureSession) {
+            previewLayer.session = session
+            observer = NotificationCenter.default.addObserver(forName: .AVCaptureSessionDidStartRunning, object: session,
+                                                              queue: .main) { [weak self] _ in self?.applyOrientation() }
+        }
+
+        func applyOrientation() {
+            if let c = previewLayer.connection, c.isVideoOrientationSupported, c.videoOrientation != .landscapeRight {
+                c.videoOrientation = .landscapeRight
+            }
+        }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            applyOrientation()
+        }
+
+        deinit { if let o = observer { NotificationCenter.default.removeObserver(o) } }
     }
 
     func makeUIView(context: Context) -> PreviewView {
         let v = PreviewView()
-        v.previewLayer.session = session
+        v.attach(session)
         v.previewLayer.videoGravity = .resizeAspect
         v.backgroundColor = .black
         return v
     }
 
-    func updateUIView(_ v: PreviewView, context: Context) {
-        if let c = v.previewLayer.connection, c.isVideoOrientationSupported { c.videoOrientation = .landscapeRight }
-    }
+    func updateUIView(_ v: PreviewView, context: Context) { v.applyOrientation() }
 }
 
 /// Maps capture pixels into an aspect-fit view rect.
