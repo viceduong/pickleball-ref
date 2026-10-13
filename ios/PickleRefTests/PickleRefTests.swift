@@ -46,9 +46,9 @@ final class GeometryTests: XCTestCase {
 }
 
 final class CalibrationTests: XCTestCase {
-    private func run(eye: Vec3, target: Vec3, seed: UInt64) throws {
+    private func run(eye: Vec3, target: Vec3, seed: UInt64, hfov: Double = 69) throws {
         let w = 960, h = 540
-        let cam = Synthetic.camera(eye: eye, target: target, width: w, height: h)
+        let cam = Synthetic.camera(eye: eye, target: target, width: w, height: h, hfov: hfov)
         let img = Synthetic.renderCourt(cam, width: w, height: h, seed: seed)
         let result = try XCTUnwrap(CourtCalibrator().calibrate(img), "court not found")
         // Max reprojection error over court points visible in the image, modulo court symmetry.
@@ -83,6 +83,11 @@ final class CalibrationTests: XCTestCase {
 
     func testAutoCalibrationKitchenSideView() throws {
         try run(eye: Vec3(-12, 22, 7), target: Vec3(10, 22, 0), seed: 6)
+    }
+
+    func testAutoCalibrationUltraWideCloseBaseline() throws {
+        // 0.5x lens (~108 deg) on a tripod 6 ft behind the baseline sees the whole court.
+        try run(eye: Vec3(10, -6, 8), target: Vec3(10, 20, 0), seed: 3, hfov: 108)
     }
 
     func testAutoCalibrationFarBaselineView() throws {

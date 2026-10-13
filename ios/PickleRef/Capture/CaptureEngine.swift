@@ -4,9 +4,19 @@ import Foundation
 import ImageIO
 import UIKit
 
+enum CameraLens: String, CaseIterable, Identifiable {
+    case ultraWide = "0.5x Ultra-wide"
+    case wide = "1x Wide"
+    var id: String { rawValue }
+    var deviceType: AVCaptureDevice.DeviceType { self == .ultraWide ? .builtInUltraWideCamera : .builtInWideAngleCamera }
+}
+
 struct CaptureSettings {
     var targetFps: Double = 120
-    var fastShutter = true
+    /// Ultra-wide covers the whole court from a tripod close to it.
+    var lens: CameraLens = .ultraWide
+    /// Auto-exposure shutter cap (s); 0 = uncapped. Short shutters keep the ball sharp, AE raises ISO instead.
+    var maxShutter: Double = 1.0 / 500
     var useNeural = true
     var useVisionTrajectories = true
     var usePose = true
@@ -33,6 +43,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     // Callbacks (main thread).
     var onCalibration: ((CourtGeometry?, String) -> Void)?
     var onStats: ((Double, Bool) -> Void)?
+    var onFormat: ((String) -> Void)?
 
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private lazy var thumbRenderer = BufferRenderer(width: 640, height: 360, context: ciContext)
@@ -91,17 +102,27 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
     func apply(_ s: CaptureSettings) {
         sessionQueue.async {
-            let fpsChanged = s.targetFps != self.settings.targetFps || s.fastShutter != self.settings.fastShutter
+            let old = self.settings
             self.settings = s
-            if fpsChanged, let d = self.device { self.configureFormat(d) }
+            if s.lens != old.lens {
+                self.switchInput()
+                self.recalibrate()
+            } else if s.targetFps != old.targetFps || s.maxShutter != old.maxShutter, let d = self.device {
+                self.configureFormat(d)
+            }
         }
+    }
+
+    /// Back camera for the selected lens, falling back to the 1x wide camera (ultra-wide needs iPhone 11+).
+    private func selectDevice() -> AVCaptureDevice? {
+        AVCaptureDevice.default(settings.lens.deviceType, for: .video, position: .back)
+            ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
     }
 
     private func configure() {
         session.beginConfiguration()
         session.sessionPreset = .inputPriority
-        guard let d = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
-              let input = try? AVCaptureDeviceInput(device: d), session.canAddInput(input) else {
+        guard let d = selectDevice(), let input = try? AVCaptureDeviceInput(device: d), session.canAddInput(input) else {
             session.commitConfiguration(); return
         }
         session.addInput(input)
@@ -110,15 +131,30 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange]
         output.setSampleBufferDelegate(self, queue: videoQueue)
         if session.canAddOutput(output) { session.addOutput(output) }
-        if let c = output.connection(with: .video) {
-            if c.isVideoOrientationSupported { c.videoOrientation = .landscapeRight }
-            if c.isVideoStabilizationSupported { c.preferredVideoStabilizationMode = .off }
-        }
+        configureConnection()
         session.commitConfiguration()
         configureFormat(d)
     }
 
-    /// Highest-value format: 1080p (or 720p) at the requested frame rate, fast shutter for sharp balls.
+    private func switchInput() {
+        guard let d = selectDevice(), d != device, let input = try? AVCaptureDeviceInput(device: d) else { return }
+        session.beginConfiguration()
+        for i in session.inputs { session.removeInput(i) }
+        if session.canAddInput(input) { session.addInput(input); device = d }
+        configureConnection()
+        session.commitConfiguration()
+        if let dev = device { configureFormat(dev) }
+    }
+
+    private func configureConnection() {
+        if let c = output.connection(with: .video) {
+            if c.isVideoOrientationSupported { c.videoOrientation = .landscapeRight }
+            if c.isVideoStabilizationSupported { c.preferredVideoStabilizationMode = .off }
+        }
+    }
+
+    /// Best format for the lens: 1080p (or 720p) at the requested frame rate, falling back to lower rates
+    /// (ultra-wide lenses often top out at 60 fps). Continuous auto-exposure with a shutter cap.
     private func configureFormat(_ d: AVCaptureDevice) {
         let want = settings.targetFps
         func ok(_ f: AVCaptureDevice.Format, _ w: Int32, _ fps: Double) -> Bool {
@@ -141,18 +177,19 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             let dur = CMTime(value: 1, timescale: CMTimeScale(fps))
             d.activeVideoMinFrameDuration = dur
             d.activeVideoMaxFrameDuration = dur
+            // Rectilinear output so the court homography model holds (matters on the ultra-wide lens).
+            if d.isGeometricDistortionCorrectionSupported { d.isGeometricDistortionCorrectionEnabled = true }
             if d.isFocusModeSupported(.continuousAutoFocus) { d.focusMode = .continuousAutoFocus }
-            if settings.fastShutter && d.isExposureModeSupported(.custom) {
-                // ≤1/1000 s keeps a 30 mph ball under ~1.3 cm of blur; compensate with ISO.
-                let target = CMTime(value: 1, timescale: 1000)
-                let minD = format.minExposureDuration, maxD = format.maxExposureDuration
-                let duration = CMTimeClampToRange(target, range: CMTimeRange(start: minD, end: maxD))
-                let current = d.exposureDuration.seconds > 0 ? d.exposureDuration.seconds : 1.0 / fps
-                let gain = current / duration.seconds
-                let iso = min(format.maxISO, max(format.minISO, d.iso * Float(gain)))
-                d.setExposureModeCustom(duration: duration, iso: iso, completionHandler: nil)
-            } else if d.isExposureModeSupported(.continuousAutoExposure) {
+            if d.isExposureModeSupported(.continuousAutoExposure) {
                 d.exposureMode = .continuousAutoExposure
+                // Setting activeFormat resets the cap, so apply it afterwards.
+                if settings.maxShutter > 0 {
+                    let cap = CMTime(seconds: settings.maxShutter, preferredTimescale: 1_000_000)
+                    d.activeMaxExposureDuration = CMTimeClampToRange(cap, range: CMTimeRange(start: format.minExposureDuration,
+                                                                                             end: format.maxExposureDuration))
+                } else {
+                    d.activeMaxExposureDuration = .invalid
+                }
             }
             d.unlockForConfiguration()
         } catch { return }
@@ -161,6 +198,9 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         imageSize = Vec2(Double(dims.width), Double(dims.height))
         deviceFps = fps
         engine.setFps(fps)
+        let lensName = d.deviceType == .builtInUltraWideCamera ? "0.5x" : "1x"
+        let info = String(format: "%@ · %dp%.0f · %.0f° FOV", lensName, Int(dims.height), fps, hfov)
+        DispatchQueue.main.async { self.onFormat?(info) }
     }
 
     // MARK: Per-frame pipeline

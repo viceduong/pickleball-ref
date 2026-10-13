@@ -15,6 +15,7 @@ final class AppModel: ObservableObject {
     @Published var kitchenCalls = true { didSet { engine.setKitchen(kitchenCalls) } }
     @Published var linkPhones = false { didSet { linkPhones ? peers.start() : peers.stop() } }
     @Published var cameraDenied = false
+    @Published var cameraInfo = ""
 
     let engine: RefereeEngine
     let capture: CaptureEngine
@@ -36,6 +37,7 @@ final class AppModel: ObservableObject {
             self?.status = g.map { Self.describe($0) } ?? msg
         }
         capture.onStats = { [weak self] fps, _ in self?.fps = fps }
+        capture.onFormat = { [weak self] info in self?.cameraInfo = info }
         engine.onCall = { [weak self] call, contact in
             DispatchQueue.main.async { self?.receive(call, contact: contact) }
         }

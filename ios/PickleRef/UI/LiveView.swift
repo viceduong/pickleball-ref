@@ -45,6 +45,7 @@ struct LiveView: View {
             Spacer()
             VStack(alignment: .trailing, spacing: 4) {
                 Text(String(format: "%.0f fps", model.fps)).font(.caption.monospacedDigit())
+                if !model.cameraInfo.isEmpty { Text(model.cameraInfo).font(.caption2) }
                 if model.linkPhones {
                     Text(model.peers.peers.isEmpty ? "Linking…" : "Linked: \(model.peers.peers.count + 1) phones")
                         .font(.caption)

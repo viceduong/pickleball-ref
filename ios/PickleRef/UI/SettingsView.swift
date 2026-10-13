@@ -11,7 +11,14 @@ struct SettingsView: View {
                     Picker("Frame rate", selection: $model.settings.targetFps) {
                         Text("60 fps").tag(60.0); Text("120 fps").tag(120.0); Text("240 fps").tag(240.0)
                     }
-                    Toggle("Fast shutter (1/1000 s)", isOn: $model.settings.fastShutter)
+                    Picker("Lens", selection: $model.settings.lens) {
+                        ForEach(CameraLens.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    Picker("Max shutter (auto-exposure)", selection: $model.settings.maxShutter) {
+                        Text("1/1000 s").tag(1.0 / 1000); Text("1/500 s").tag(1.0 / 500)
+                        Text("1/250 s").tag(1.0 / 250); Text("No cap").tag(0.0)
+                    }
+                    if !model.cameraInfo.isEmpty { Text(model.cameraInfo).font(.caption).foregroundColor(.secondary) }
                     Button("Recalibrate court") { model.recalibrate(); dismiss() }
                 }
                 Section {
@@ -35,7 +42,8 @@ struct SettingsView: View {
                 Section("Setup tips") {
                     Text("• Tripod 6–10 ft high, behind a baseline (line calls) or beside the kitchen line (NVZ faults).")
                     Text("• Keep all court lines in frame; calibration is automatic and re-checks every few seconds.")
-                    Text("• Use 120 fps in daylight; 60 fps indoors if the image is too dark.")
+                    Text("• Ultra-wide (0.5x) fits the whole court from close by; 1x gives more pixels per ball if the court fits.")
+                    Text("• Exposure is automatic; relax the shutter cap (1/250) if indoor video is too dark or noisy.")
                     Text("• TOO CLOSE means the measurement can't separate ball and line — rule 8.D says IN.")
                 }
                 .font(.footnote)
