@@ -46,7 +46,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     var onFormat: ((String) -> Void)?
 
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
-    private lazy var thumbRenderer = BufferRenderer(width: 640, height: 360, context: ciContext)
+    private var thumbRenderer: BufferRenderer?
     private lazy var nnRenderer = BufferRenderer(width: NeuralBallDetector.inputSize.w, height: NeuralBallDetector.inputSize.h, context: ciContext)
     private let motion = MotionBlobDetector()
     private let trajectories = VisionTrajectoryDetector()
@@ -153,24 +153,31 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         }
     }
 
-    /// Best format for the lens: 1080p (or 720p) at the requested frame rate, falling back to lower rates
-    /// (ultra-wide lenses often top out at 60 fps). Continuous auto-exposure with a shutter cap.
+    /// Format with the widest vertical field of view (court depth runs vertically in landscape): full-sensor 4:3
+    /// formats beat 16:9 crops. Among equals, the highest frame rate up to the target, then ~1080p resolution.
     private func configureFormat(_ d: AVCaptureDevice) {
         let want = settings.targetFps
-        func ok(_ f: AVCaptureDevice.Format, _ w: Int32, _ fps: Double) -> Bool {
+        struct Cand { let f: AVCaptureDevice.Format; let vfov: Double; let fps: Double; let width: Int32 }
+        var cands: [Cand] = []
+        for f in d.formats {
             let dims = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
-            let sub = CMFormatDescriptionGetMediaSubType(f.formatDescription)
-            return dims.width == w && sub == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange &&
-                f.videoSupportedFrameRateRanges.contains { $0.maxFrameRate >= fps - 0.5 }
+            guard CMFormatDescriptionGetMediaSubType(f.formatDescription) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                  dims.width >= 1280, dims.width <= 2112 else { continue }
+            let maxFps = f.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0
+            let fps = [240.0, 120, 60, 30].first { $0 <= min(want, maxFps) + 0.5 } ?? 30
+            let hf = Double(f.videoFieldOfView) * .pi / 180
+            let vfov = 2 * atan(tan(hf / 2) * Double(dims.height) / Double(dims.width)) * 180 / .pi
+            cands.append(Cand(f: f, vfov: vfov, fps: fps, width: dims.width))
         }
-        var chosen: AVCaptureDevice.Format?
-        var fps = want
-        for candidateFps in [want, 120, 60, 30] where candidateFps <= want {
-            if let f = d.formats.first(where: { ok($0, 1920, candidateFps) }) ?? d.formats.first(where: { ok($0, 1280, candidateFps) }) {
-                chosen = f; fps = candidateFps; break
-            }
-        }
-        guard let format = chosen else { return }
+        // Prefer ≥60 fps (bounce timing), then the widest vertical view, then frame rate, then resolution near 1920.
+        let pool = cands.contains { $0.fps >= 60 } ? cands.filter { $0.fps >= 60 } : cands
+        guard let best = pool.max(by: { a, b in
+            if abs(a.vfov - b.vfov) > 1 { return a.vfov < b.vfov }
+            if a.fps != b.fps { return a.fps < b.fps }
+            return abs(Int(a.width) - 1920) > abs(Int(b.width) - 1920)
+        }) else { return }
+        let format = best.f
+        let fps = best.fps
         do {
             try d.lockForConfiguration()
             d.activeFormat = format
@@ -198,8 +205,9 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         imageSize = Vec2(Double(dims.width), Double(dims.height))
         deviceFps = fps
         engine.setFps(fps)
-        let lensName = d.deviceType == .builtInUltraWideCamera ? "0.5x" : "1x"
-        let info = String(format: "%@ · %dp%.0f · %.0f° FOV", lensName, Int(dims.height), fps, hfov)
+        var lensName = d.deviceType == .builtInUltraWideCamera ? "0.5x" : "1x"
+        if settings.lens == .ultraWide && d.deviceType != .builtInUltraWideCamera { lensName = "1x (no ultra-wide on this iPhone)" }
+        let info = String(format: "%@ · %dx%d@%.0f · %.0f°×%.0f° FOV", lensName, Int(dims.width), Int(dims.height), fps, hfov, best.vfov)
         DispatchQueue.main.async { self.onFormat?(info) }
     }
 
@@ -219,7 +227,9 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         // Replay thumbnails (≤ 60 fps).
         if t - lastThumb >= 1.0 / 61 {
             lastThumb = t
-            if let small = thumbRenderer.render(pb) {
+            let thumbH = (640 * h / max(1, w)) & ~1
+            if thumbRenderer?.height != thumbH { thumbRenderer = BufferRenderer(width: 640, height: thumbH, context: ciContext) }
+            if let small = thumbRenderer?.render(pb) {
                 thumbQueue.async {
                     let ci = CIImage(cvPixelBuffer: small)
                     if let data = self.ciContext.jpegRepresentation(of: ci, colorSpace: CGColorSpaceCreateDeviceRGB(),
@@ -374,46 +384,63 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     }
 }
 
-/// Requires several consecutive agreeing calibrations before locking (robust to players crossing lines).
+/// Locks once two calibrations agree on the visible court (or one is unambiguous). Tolerates
+/// intermittent failures (players crossing lines) instead of restarting the count.
 final class AutoCalibration {
     enum State { case searching(String), locked(CalibrationResult) }
     private var recent: [CalibrationResult] = []
     private var failures = 0
+    private var consecutiveFailures = 0
 
-    func reset() { recent.removeAll(); failures = 0 }
+    func reset() { recent.removeAll(); failures = 0; consecutiveFailures = 0 }
 
     func add(_ r: CalibrationResult?) -> State {
         guard let r = r else {
             failures += 1
-            recent.removeAll()
+            consecutiveFailures += 1
+            if consecutiveFailures >= 6 { recent.removeAll() }
+            if !recent.isEmpty { return .searching("Court found — verifying…") }
             return .searching(failures > 8
-                ? "Court not found — mount phone 6+ ft high behind a baseline or beside the kitchen, all lines in view"
+                ? "Court not found — mount phone 6+ ft high behind a baseline or beside the kitchen, lines in view"
                 : "Searching for court lines…")
         }
-        if let last = recent.last, Self.cornerDistance(last.courtToImage, r.courtToImage) > 8 { recent.removeAll() }
-        recent.append(r)
-        if recent.count >= 3 {
-            let best = recent.max { $0.inlierRatio < $1.inlierRatio }!
+        consecutiveFailures = 0
+        // Unambiguous single result: most of the court model is confirmed by line pixels.
+        if r.inlierRatio >= 0.85 && r.hits >= 150 { recent.removeAll(); return .locked(r) }
+        let tol = max(10, 0.008 * Double(r.imageWidth))
+        if let match = recent.last(where: { Self.visibleDistance($0, r) <= tol }) {
             recent.removeAll()
-            return .locked(best)
+            return .locked(match.inlierRatio > r.inlierRatio ? match : r)
         }
-        return .searching("Court found — verifying (\(recent.count)/3)…")
+        recent.append(r)
+        if recent.count > 4 { recent.removeFirst() }
+        return .searching(String(format: "Court found — verifying (%.0f%% lines matched)…", r.inlierRatio * 100))
     }
 
-    /// Max reprojection distance of court corners between two calibrations, modulo court symmetry.
-    static func cornerDistance(_ a: Homography, _ b: Homography) -> Double {
-        let flips: [Homography] = [
-            .identity,
-            Homography(rows: [[-1, 0, Court.width], [0, 1, 0], [0, 0, 1]]),
-            Homography(rows: [[1, 0, 0], [0, -1, Court.length], [0, 0, 1]]),
-            Homography(rows: [[-1, 0, Court.width], [0, -1, Court.length], [0, 0, 1]]),
-        ]
-        let pts = Court.corners + [Vec2(Court.width / 2, Court.net)]
+    /// Max distance between two calibrations over court points visible in `a`'s image, modulo court symmetry.
+    static func visibleDistance(_ a: CalibrationResult, _ b: CalibrationResult) -> Double {
+        var pts: [Vec2] = []
+        for i in 0...8 { for j in 0...22 { pts.append(Vec2(Double(i) * 2.5, Double(j) * 2)) } }
+        let w = Double(a.imageWidth), h = Double(a.imageHeight)
+        let visible = pts.filter { p in
+            let v = a.courtToImage.homogeneous(p)
+            guard v.z > 0 else { return false }
+            let q = Vec2(v.x / v.z, v.y / v.z)
+            return q.x >= 0 && q.y >= 0 && q.x <= w && q.y <= h
+        }
+        guard visible.count >= 6 else { return .infinity }
         return flips.map { f in
-            let bb = f.then(b)
-            return pts.map { (a.apply($0) - bb.apply($0)).length }.max() ?? .infinity
+            let bb = f.then(b.courtToImage)
+            return visible.map { (a.courtToImage.apply($0) - bb.apply($0)).length }.max() ?? .infinity
         }.min() ?? .infinity
     }
+
+    static let flips: [Homography] = [
+        .identity,
+        Homography(rows: [[-1, 0, Court.width], [0, 1, 0], [0, 0, 1]]),
+        Homography(rows: [[1, 0, 0], [0, -1, Court.length], [0, 0, 1]]),
+        Homography(rows: [[-1, 0, Court.width], [0, -1, Court.length], [0, 0, 1]]),
+    ]
 
     /// Fraction of court-line samples supported by line pixels in `img`.
     static func support(of h: Homography, in img: GrayImage) -> Double {

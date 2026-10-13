@@ -95,6 +95,33 @@ final class CalibrationTests: XCTestCase {
     }
 }
 
+final class AutoCalibrationLockTests: XCTestCase {
+    private func result(_ eye: Vec3, jitter: Double, inlier: Int = 120, visible: Int = 160) -> CalibrationResult {
+        let cam = Synthetic.camera(eye: eye, target: Vec3(10, 22, 0), width: 1920, height: 1080)
+        let h = cam.groundHomography.then(Homography(rows: [[1, 0, jitter], [0, 1, -jitter], [0, 0, 1]]))
+        return CalibrationResult(courtToImage: h, hits: inlier, visibleSamples: visible, rmsPx: 0.8, imageWidth: 1920, imageHeight: 1080)
+    }
+
+    func testLocksOnTwoAgreeingPartialViewsDespiteFailures() {
+        let auto = AutoCalibration()
+        // Partial sideline view: court corners are off-screen.
+        if case .locked = auto.add(result(Vec3(-12, 22, 7), jitter: 0)) { XCTFail("should not lock on first moderate result") }
+        if case .locked = auto.add(nil) { XCTFail() }   // a player blocks the lines for one frame
+        guard case .locked = auto.add(result(Vec3(-12, 22, 7), jitter: 3)) else { return XCTFail("should lock") }
+    }
+
+    func testRejectsDisagreeingResults() {
+        let auto = AutoCalibration()
+        _ = auto.add(result(Vec3(-12, 22, 7), jitter: 0))
+        if case .locked = auto.add(result(Vec3(-12, 22, 7), jitter: 60)) { XCTFail("60 px apart must not lock") }
+    }
+
+    func testStrongSingleResultLocksImmediately() {
+        let auto = AutoCalibration()
+        guard case .locked = auto.add(result(Vec3(10, -16, 10), jitter: 0, inlier: 190, visible: 200)) else { return XCTFail() }
+    }
+}
+
 final class EventTests: XCTestCase {
     private let cam = Synthetic.camera(eye: Vec3(10, -15, 9), target: Vec3(10, 26, 0), width: 1920, height: 1080)
     private var geometry: CourtGeometry {
